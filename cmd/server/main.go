@@ -15,6 +15,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 type greetingResponse struct {
@@ -36,10 +43,57 @@ const (
 	defaultMetricsAddr = ":9092"
 )
 
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	exporter, err := otlptracegrpc.New(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := resource.New(
+		ctx,
+		resource.WithFromEnv(),
+		resource.WithProcess(),
+		resource.WithTelemetrySDK(),
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String("rest-greeting"),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	)
+
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(
+		propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{},
+			propagation.Baggage{},
+		),
+	)
+
+	return tp, nil
+}
+
 func main() {
 	httpAddr := flag.String("http-addr", defaultHTTPAddr, "HTTP listen address")
 	metricsAddr := flag.String("metrics-addr", defaultMetricsAddr, "Prometheus metrics listen address")
 	flag.Parse()
+
+	tp, err := initTracer(context.Background())
+	if err != nil {
+		log.Fatalf("failed to set up tracing: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tp.Shutdown(ctx); err != nil {
+			log.Printf("tracer provider shutdown failed: %v", err)
+		}
+	}()
 
 	requestCounter := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -105,12 +159,14 @@ func main() {
 	log.Println("shutdown complete")
 }
 
-func instrumentHandler(path string, counter *prometheus.CounterVec, duration *prometheus.HistogramVec, handler http.Handler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func instrumentHandler(path string, counter *prometheus.CounterVec, duration *prometheus.HistogramVec, handler http.Handler) http.Handler {
+	otelHandler := otelhttp.NewHandler(handler, path)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 
-		handler.ServeHTTP(recorder, r)
+		otelHandler.ServeHTTP(recorder, r)
 
 		elapsed := time.Since(start).Seconds()
 		statusCode := recorder.status
@@ -121,7 +177,7 @@ func instrumentHandler(path string, counter *prometheus.CounterVec, duration *pr
 		}
 		counter.With(labels).Inc()
 		duration.With(labels).Observe(elapsed)
-	}
+	})
 }
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
