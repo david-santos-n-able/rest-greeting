@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,7 +23,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/semconv/v1.26.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 type greetingResponse struct {
@@ -44,10 +46,6 @@ const (
 )
 
 func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
-	exporter, err := otlptracegrpc.New(ctx)
-	if err != nil {
-		return nil, err
-	}
 
 	res, err := resource.New(
 		ctx,
@@ -58,8 +56,25 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 			semconv.ServiceNameKey.String("rest-greeting"),
 		),
 	)
+
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create resource: %w", err)
+	}
+
+	clientOpts := []otlptracegrpc.Option{}
+	if endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); endpoint == "" {
+		clientOpts = append(clientOpts, otlptracegrpc.WithEndpoint("localhost:4317"))
+	}
+	if strings.ToLower(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")) != "false" {
+		clientOpts = append(clientOpts, otlptracegrpc.WithInsecure())
+	}
+
+	exporterCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	exporter, err := otlptracegrpc.New(exporterCtx, clientOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("create otlp exporter: %w", err)
 	}
 
 	tp := sdktrace.NewTracerProvider(
